@@ -25,3 +25,10 @@ torso lean, stance width, racket-hand speed and distance covered (normalised by 
 are 2D and camera-angle dependent, and are passed to Gemini as supporting evidence. When two players overlap
 the tracker can merge them - the app shows a checkable skeleton frame and a low-confidence warning. Best
 results: one player clearly visible, fixed camera.
+
+## Court calibration & recovery to the T
+Tick *Calibrate the court* and click 4+ known floor points (e.g. the four floor corners) on a video frame.
+`court.py` builds a pixel->court homography (court 6.4 x 9.75 m, T at 3.2 m / 5.49 m), maps the player's
+feet onto the court and measures each trip away from the T: time from the farthest point (beyond 2 m)
+until back within 1 m of the T. Pauses longer than 5 s are ignored. Needs a fixed camera; accuracy depends
+on how precisely the points are clicked and on the pose tracker following the right player.

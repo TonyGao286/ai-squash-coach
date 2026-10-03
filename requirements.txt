@@ -3,3 +3,4 @@ google-genai>=1.0.0
 mediapipe==0.10.14
 opencv-python-headless>=4.8
 numpy<2
+streamlit-image-coordinates>=0.1.9

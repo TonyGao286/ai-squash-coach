@@ -4,12 +4,16 @@ from google.genai import types
 import tempfile
 import os
 import time
+import cv2
+import numpy as np
+from streamlit_image_coordinates import streamlit_image_coordinates
 import mimetypes
 import json
 import re
 
 import history
 import pose_metrics
+import court
 
 MODEL_NAME = "gemini-2.5-flash"
 MAX_UPLOAD_MB = 100
@@ -89,6 +93,12 @@ def build_prompt(coach_instruction, benchmarks, metrics=None):
                if metrics.get("reliability") == "low" else "")
             + ":\n" + json.dumps(shown, indent=1)
         )
+        if "court_recovery" in shown and "error" not in shown["court_recovery"]:
+            parts.append(
+                "'court_recovery' comes from a calibrated court map: it measures how fast the player gets back "
+                "to the T after being pulled away. Comment on T discipline and recovery speed using those "
+                "numbers (professionals typically recover in roughly 1-2 s), and cite specific events."
+            )
     parts.append(
         "Respond with ONLY valid JSON (no markdown fences) matching this shape:\n" + OUTPUT_SCHEMA
     )
@@ -127,6 +137,29 @@ def render_metrics(pose):
     for i, (key, label, unit) in enumerate(METRIC_LABELS):
         if m.get(key) is not None:
             cols[i % 3].metric(label, f"{m[key]:g} {unit}")
+    cr = m.get("court_recovery")
+    if isinstance(cr, dict):
+        st.markdown("#### ⏱️ Recovery to the T")
+        if "error" in cr:
+            st.warning(f"Court timing unavailable: {cr['error']}.")
+        else:
+            if cr.get("reliability") == "low":
+                st.warning("Court mapping looks unreliable (calibration error or player often off-court).")
+            c = st.columns(4)
+            c[0].metric("Avg recovery", f"{cr['recovery_time_avg_s']:g} s" if cr["recovery_time_avg_s"] is not None else "n/a")
+            c[1].metric("Best / worst",
+                        f"{cr['recovery_time_best_s']:g} / {cr['recovery_time_worst_s']:g} s" if cr["recovery_time_best_s"] is not None else "n/a")
+            c[2].metric("Trips from T", cr["excursions_from_T"])
+            c[3].metric("Time on the T", f"{cr['time_within_T_zone_pct']:g}%")
+            st.caption(cr["recovery_definition"].capitalize() + ". Long pauses (>5 s) are ignored.")
+            if cr["events"]:
+                st.dataframe(
+                    [{"Time (s)": e["peak_time_s"], "Farthest from T (m)": e["peak_distance_m"],
+                      "Recovery (s)": e["recovery_s"]} for e in cr["events"]],
+                    hide_index=True,
+                )
+            if pose.get("court_map") is not None:
+                st.image(pose["court_map"], caption="Player path (red), farthest points (numbered), T zone (yellow circle)", width=260)
     if pose.get("keyframe") is not None:
         st.image(
             pose["keyframe"],
@@ -228,6 +261,106 @@ def show_local_video(path):
         st.warning(f"Video file '{path}' not found in repository.")
 
 
+@st.cache_data(show_spinner=False, max_entries=8)
+def grab_frame(file_id, seconds, _data, suffix, max_width=720):
+    """Return (RGB frame at `seconds`, clip duration in seconds)."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+        f.write(_data)
+        path = f.name
+    try:
+        cap = cv2.VideoCapture(path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        duration = (cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) / fps
+        cap.set(cv2.CAP_PROP_POS_MSEC, seconds * 1000)
+        ok, bgr = cap.read()
+        cap.release()
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if not ok:
+        return None, duration
+    h, w = bgr.shape[:2]
+    if w > max_width:
+        bgr = cv2.resize(bgr, (max_width, int(h * max_width / w)))
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), duration
+
+
+def court_calibrator(uploaded_file):
+    """Click-to-calibrate UI. Returns {"landmarks", "points_norm"} when complete, else None."""
+    suffix = os.path.splitext(uploaded_file.name)[1] or ".mp4"
+    options = list(court.LANDMARKS)
+    ids = st.multiselect(
+        "Court points visible in the video (pick at least 4, then click them in this order)",
+        options=options,
+        default=court.DEFAULT_LANDMARKS,
+        format_func=lambda k: court.LANDMARKS[k][0],
+    )
+    if len(ids) < 4:
+        st.info("Select at least 4 points.")
+        return None
+
+    _, duration = grab_frame(uploaded_file.file_id, 0.0, uploaded_file.getvalue(), suffix)
+    seconds = st.slider("Frame to click on (pick one where the floor lines are clear)",
+                        0.0, max(float(duration), 0.1), 0.0, 0.1)
+    frame, _ = grab_frame(uploaded_file.file_id, seconds, uploaded_file.getvalue(), suffix)
+    if frame is None:
+        st.error("Could not read that frame.")
+        return None
+
+    sig = (uploaded_file.file_id, tuple(ids), seconds)
+    state = st.session_state.setdefault("calib", {})
+    if state.get("sig") != sig:
+        state.clear()
+        state.update(sig=sig, pts=[], resets=state.get("resets", 0) + 1)
+    pts = state["pts"]
+    h, w = frame.shape[:2]
+
+    marked = frame.copy()
+    for n, (x, y) in enumerate(pts, start=1):
+        c = (int(x * w), int(y * h))
+        cv2.circle(marked, c, 6, (255, 75, 75), -1)
+        cv2.putText(marked, str(n), (c[0] + 8, c[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+
+    done = len(pts) == len(ids)
+    H = rms = None
+    if done:
+        H, rms = court.compute_homography(np.array(pts) * [w, h], court.landmark_court_points(ids))
+        if H is None:
+            st.error("These points do not define a court (too close to a line). Reset and re-click.")
+        else:
+            marked = court.draw_court_overlay(marked, H)
+            if len(ids) == 4:
+                st.info("Check the red court lines sit on the real floor lines. If they drift, reset and click more carefully.")
+            else:
+                (st.success if rms <= 0.3 else st.warning)(
+                    f"Calibration fit error: {rms:.2f} m. Check the red court lines sit on the real floor lines"
+                    + ("" if rms <= 0.3 else " - if not, reset and click more carefully.")
+                )
+    else:
+        st.markdown(f"**Click point {len(pts) + 1}/{len(ids)}:** {court.LANDMARKS[ids[len(pts)]][0]}")
+
+    click = streamlit_image_coordinates(
+        marked, width=min(w, 480), key=f"calib_img_{state['resets']}_{len(pts)}_{done}",
+        cursor="crosshair",
+    )
+    if click and not done:
+        pts.append([click["x"] / click["width"], click["y"] / click["height"]])
+        st.rerun()
+
+    c1, c2 = st.columns(2)
+    if c1.button("Undo last point", disabled=not pts):
+        pts.pop()
+        state["resets"] += 1
+        st.rerun()
+    if c2.button("Reset points", disabled=not pts):
+        pts.clear()
+        state["resets"] += 1
+        st.rerun()
+    return {"landmarks": ids, "points_norm": [list(p) for p in pts]} if done and H is not None else None
+
+
 # --- 6. Main UI with Tabs ---
 st.title("🎾 Next-Gen Squash AI Coach")
 st.markdown("Upload your practice footage, or explore AI tactical breakdowns of PSA professionals.")
@@ -276,6 +409,17 @@ with tab_solo:
                 disabled=not use_pose,
             )
 
+            use_court = st.checkbox(
+                "Calibrate the court (enables recovery-to-T timing)", value=False, disabled=not use_pose,
+                help="Click 4 known floor points once so pixels can be converted to metres on court.",
+            )
+            calibration = None
+            if use_court and use_pose:
+                with st.container(border=True):
+                    calibration = court_calibrator(uploaded_file)
+                if calibration is None:
+                    st.caption("Finish the calibration above to include recovery timing (analysis still runs without it).")
+
             instruction = st.text_area(
                 "Coach's Instruction (optional focus)",
                 value="Focus on racket preparation timing, footwork pattern and balance during the follow-through.",
@@ -300,7 +444,9 @@ with tab_solo:
                     if use_pose:
                         with st.spinner("🦴 Tracking skeleton and measuring movement..."):
                             try:
-                                pose = pose_metrics.analyze_clip(temp_filename, start_side=start_side)
+                                pose = pose_metrics.analyze_clip(
+                                    temp_filename, start_side=start_side, calibration=calibration
+                                )
                             except Exception as e:
                                 pose = None
                                 st.warning(f"Skeleton tracking unavailable, continuing without it ({e}).")
@@ -398,6 +544,9 @@ with tab_hist:
                 m = r.get("metrics")
                 if isinstance(m, dict):
                     shown = [f"{label}: {m[k]:g} {unit}" for k, label, unit in METRIC_LABELS if m.get(k) is not None]
+                    cr = m.get("court_recovery")
+                    if isinstance(cr, dict) and cr.get("recovery_time_avg_s") is not None:
+                        shown.append(f"Avg recovery to T: {cr['recovery_time_avg_s']:g} s")
                     if shown:
                         st.caption("🦴 " + " · ".join(shown))
                 if st.button("Delete this session", key=f"del_{r['id']}"):

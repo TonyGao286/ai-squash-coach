@@ -9,6 +9,8 @@ import os
 
 import numpy as np
 
+import court
+
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "pose_landmarker_full.task")
 
 # MediaPipe pose landmark indices
@@ -176,8 +178,9 @@ def metrics_torso_px(frames):
     return float(np.median(vals)) if vals else 1.0
 
 
-def analyze_clip(video_path, start_side="largest", target_fps=15, max_seconds=60, max_width=640, model_path=MODEL_PATH):
-    """Run pose estimation on a clip. Returns dict with metrics, quality info and a keyframe image
+def analyze_clip(video_path, start_side="largest", calibration=None, target_fps=15, max_seconds=60, max_width=640, model_path=MODEL_PATH):
+    """Run pose estimation on a clip. calibration = {"landmarks": [ids], "points_norm": [[x, y], ...]} with
+    pixel positions normalised to 0-1 of the frame; when given, court-position metrics are added. Returns dict with metrics, quality info and a keyframe image
     (RGB ndarray with skeleton drawn at the deepest lunge), or None if the player was not found."""
     import cv2
     import mediapipe as mp
@@ -197,6 +200,7 @@ def analyze_clip(video_path, start_side="largest", target_fps=15, max_seconds=60
         min_tracking_confidence=0.5,
     )
     frames, times, images, sampled = [], [], [], 0
+    frame_size = None
     prev_center = None
     try:
         with vision.PoseLandmarker.create_from_options(options) as landmarker:
@@ -214,6 +218,7 @@ def analyze_clip(video_path, start_side="largest", target_fps=15, max_seconds=60
                     if w > max_width:
                         bgr = cv2.resize(bgr, (max_width, int(h * max_width / w)))
                         h, w = bgr.shape[:2]
+                    frame_size = (w, h)
                     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                     result = landmarker.detect_for_video(
                         mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), int(ts * 1000))
@@ -241,6 +246,31 @@ def analyze_clip(video_path, start_side="largest", target_fps=15, max_seconds=60
         "low" if metrics["player_detected_ratio"] < 0.8 or metrics["tracking_jumps"] >= 3 else "ok"
     )
 
+    court_map = None
+    if calibration and frame_size:
+        w, h = frame_size
+        H, rms = court.compute_homography(
+            np.asarray(calibration["points_norm"], dtype=np.float64) * [w, h],
+            court.landmark_court_points(calibration["landmarks"]),
+        )
+        if H is None:
+            metrics["court_recovery"] = {"error": "calibration points are degenerate"}
+        else:
+            foot = []
+            for f in frames:
+                feet = [f[i][:2] for i in (L_ANK, R_ANK) if f[i][2] >= MIN_VIS]
+                foot.append(np.mean(feet, axis=0) if feet else [np.nan, np.nan])
+            xy = court.to_court(H, np.asarray(foot, dtype=np.float64))
+            cm, events = court.analyze_positions(times, xy)
+            if cm is None:
+                metrics["court_recovery"] = {"error": "not enough on-court positions to measure recovery"}
+            else:
+                cm["calibration_error_m"] = round(rms, 2)
+                if rms > 0.5:
+                    cm["reliability"] = "low"
+                metrics["court_recovery"] = cm
+                court_map = court.draw_topdown(xy[np.isfinite(xy).all(axis=1)], events)
+
     keyframe = None
     if deepest is not None:
         img = images[deepest].copy()
@@ -254,4 +284,5 @@ def analyze_clip(video_path, start_side="largest", target_fps=15, max_seconds=60
             if pts[i][2] >= MIN_VIS:
                 cv2.circle(img, (int(pts[i][0]), int(pts[i][1])), 5, (255, 255, 255), -1)
         keyframe = img
-    return {"metrics": metrics, "keyframe": keyframe, "keyframe_time": round(times[deepest], 1) if deepest is not None else None}
+    return {"metrics": metrics, "keyframe": keyframe, "keyframe_time": round(times[deepest], 1) if deepest is not None else None,
+            "court_map": court_map}
