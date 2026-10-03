@@ -7,6 +7,8 @@ import mimetypes
 import json
 import re
 
+import history
+
 MODEL_NAME = "gemini-2.5-flash"
 MAX_UPLOAD_MB = 100
 PROCESSING_TIMEOUT_S = 300
@@ -181,7 +183,9 @@ def show_local_video(path):
 st.title("🎾 Next-Gen Squash AI Coach")
 st.markdown("Upload your practice footage, or explore AI tactical breakdowns of PSA professionals.")
 
-tab_solo, tab_pro = st.tabs(["📹 Solo Training (Analyze My Video)", "🏆 Pro Case Studies (PSA)"])
+tab_solo, tab_hist, tab_pro = st.tabs(
+    ["📹 Solo Training (Analyze My Video)", "📈 History & Progress", "🏆 Pro Case Studies (PSA)"]
+)
 
 # ==== Tab 1: upload & analyze ====
 with tab_solo:
@@ -209,6 +213,8 @@ with tab_solo:
                 format_func=titles.get,
             )
 
+            note = st.text_input("Session note (optional, saved to history)", placeholder="e.g. Tuesday drill, backhand boast")
+
             instruction = st.text_area(
                 "Coach's Instruction (optional focus)",
                 value="Focus on racket preparation timing, footwork pattern and balance during the follow-through.",
@@ -235,6 +241,16 @@ with tab_solo:
                         report = parse_report(result)
                         if report:
                             render_report(report)
+                            try:
+                                history.add_record(
+                                    report,
+                                    filename=uploaded_file.name,
+                                    note=note.strip(),
+                                    benchmarks=[b["id"] for b in chosen],
+                                )
+                                st.caption("💾 Saved to History tab.")
+                            except OSError as e:
+                                st.warning(f"Could not save to history: {e}")
                         else:
                             st.markdown("### 📋 AI Scouting Report")
                             st.markdown(result)
@@ -246,7 +262,72 @@ with tab_solo:
                     except OSError:
                         pass
 
-# ==== Tab 2: pro benchmark library ====
+# ==== Tab 2: history & progress ====
+def format_ts(ts):
+    return ts.replace("T", " ")[:16]
+
+
+with tab_hist:
+    st.markdown("### 📈 Progress Over Time")
+    records = history.load_history()
+
+    with st.expander("Backup / restore history"):
+        st.caption(
+            "History is stored in a local file. On hosted deployments that file may be reset "
+            "when the app restarts, so download a backup now and then."
+        )
+        st.download_button(
+            "Download history (JSON)",
+            data=json.dumps(records, ensure_ascii=False, indent=2),
+            file_name="squash_history.json",
+            mime="application/json",
+            disabled=not records,
+        )
+        imported = st.file_uploader("Restore from backup", type=["json"], key="history_import")
+        if imported is not None and st.button("Import backup"):
+            try:
+                added = history.merge_records(json.loads(imported.getvalue().decode("utf-8")))
+                st.success(f"Imported {added} new session(s).")
+                st.rerun()
+            except (ValueError, OSError) as e:
+                st.error(f"Could not import: {e}")
+
+    if not records:
+        st.info("No sessions yet. Run an analysis in the Solo Training tab and it will appear here.")
+    else:
+        scored = [
+            {"Date": format_ts(r["timestamp"]), "Score": r["report"]["overall_score"]}
+            for r in records
+            if isinstance(r["report"].get("overall_score"), (int, float))
+        ]
+        if len(scored) >= 2:
+            st.line_chart(scored, x="Date", y="Score")
+            delta = scored[-1]["Score"] - scored[0]["Score"]
+            st.metric("Change since first session", f"{scored[-1]['Score']}/10", f"{delta:+g}")
+        elif scored:
+            st.caption("Run at least two sessions to see a progress chart.")
+
+        st.markdown("#### Sessions")
+        for r in reversed(records):
+            rep = r["report"]
+            score = rep.get("overall_score")
+            label = f"{format_ts(r['timestamp'])} - {r.get('note') or r.get('filename') or 'Session'}"
+            if score is not None:
+                label += f"  ({score}/10)"
+            with st.expander(label):
+                if rep.get("summary"):
+                    st.markdown(rep["summary"])
+                for issue in rep.get("issues") or []:
+                    if isinstance(issue, dict):
+                        st.markdown(f"- **{issue.get('area', '')}:** {issue.get('fix', '')}")
+                if st.button("Delete this session", key=f"del_{r['id']}"):
+                    try:
+                        history.delete_record(r["id"])
+                        st.rerun()
+                    except OSError as e:
+                        st.error(f"Could not delete: {e}")
+
+# ==== Tab 3: pro benchmark library ====
 with tab_pro:
     st.markdown("### 🧠 Tactical Breakdown: Paul Coll (Former World #1)")
     st.info(

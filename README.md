@@ -13,3 +13,8 @@ streamlit run app.py
 Pro reference breakdowns live in `benchmarks.json` (video file, focus, key points). Add an entry
 there and the Pro tab and the comparison selector pick it up automatically. Analysis output is
 structured JSON (score, strengths, issues vs. benchmark, drills) rendered as a report.
+
+## History
+Every successful analysis is saved to `history.json` (override with `SQUASH_HISTORY_FILE`) and shown in
+the **History & Progress** tab with a score trend. Hosted filesystems (e.g. Streamlit Cloud) can reset on
+restart, so use the tab's download/restore buttons to back up.
