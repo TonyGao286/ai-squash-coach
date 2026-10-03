@@ -9,6 +9,7 @@ import json
 import re
 
 import history
+import pose_metrics
 
 MODEL_NAME = "gemini-2.5-flash"
 MAX_UPLOAD_MB = 100
@@ -65,7 +66,7 @@ OUTPUT_SCHEMA = """{
 }"""
 
 
-def build_prompt(coach_instruction, benchmarks):
+def build_prompt(coach_instruction, benchmarks, metrics=None):
     parts = [
         "Act as an elite squash biomechanics analyst. Base your analysis STRICTLY on the "
         "visual evidence in this specific video. Do not use generic squash cliches. "
@@ -77,6 +78,17 @@ def build_prompt(coach_instruction, benchmarks):
         for b in benchmarks:
             points = "\n".join(f"- {p}" for p in b["key_points"])
             parts.append(f"Benchmark - {b['player']}: {b['title']}\n{b['focus']}\n{points}")
+    if metrics:
+        shown = {k: v for k, v in metrics.items() if v is not None}
+        parts.append(
+            "Skeleton-tracking measurements for the player (MediaPipe pose, 2D, camera-angle dependent; "
+            "distances in torso lengths; angles in degrees; 'deepest' and 'peak' values are 5th/95th "
+            "percentiles). Use them as supporting evidence and quote the numbers in your observations, "
+            "but trust the video when they disagree"
+            + (" - tracking reliability is LOW (the tracker may have mixed up players), so treat them with caution"
+               if metrics.get("reliability") == "low" else "")
+            + ":\n" + json.dumps(shown, indent=1)
+        )
     parts.append(
         "Respond with ONLY valid JSON (no markdown fences) matching this shape:\n" + OUTPUT_SCHEMA
     )
@@ -91,6 +103,36 @@ def parse_report(text):
     except ValueError:
         return None
     return data if isinstance(data, dict) else None
+
+
+METRIC_LABELS = [
+    ("lead_knee_angle_deepest_deg", "Deepest knee bend", "°"),
+    ("torso_lean_peak_deg", "Peak torso lean", "°"),
+    ("stance_width_peak_x_shoulder_width", "Widest stance", "× shoulders"),
+    ("racket_wrist_peak_speed_torso_per_s", "Racket-hand peak speed", "torso/s"),
+    ("distance_covered_torso_lengths", "Distance covered", "torso lengths"),
+    ("avg_movement_speed_torso_per_s", "Avg movement speed", "torso/s"),
+]
+
+
+def render_metrics(pose):
+    m = pose["metrics"]
+    st.markdown("### 🦴 Measured Movement")
+    if m.get("reliability") == "low":
+        st.warning(
+            "Tracking confidence is low (player lost or swapped with the opponent). "
+            "Treat these numbers as rough; a clip with one player clearly visible works best."
+        )
+    cols = st.columns(3)
+    for i, (key, label, unit) in enumerate(METRIC_LABELS):
+        if m.get(key) is not None:
+            cols[i % 3].metric(label, f"{m[key]:g} {unit}")
+    if pose.get("keyframe") is not None:
+        st.image(
+            pose["keyframe"],
+            caption=f"Deepest-knee-bend frame at {pose['keyframe_time']}s - check the skeleton is on the right player",
+            width=320,
+        )
 
 
 def render_report(report):
@@ -222,6 +264,18 @@ with tab_solo:
 
             note = st.text_input("Session note (optional, saved to history)", placeholder="e.g. Tuesday drill, backhand boast")
 
+            use_pose = st.checkbox(
+                "Add skeleton motion metrics (knee bend, stance, swing speed, movement)", value=True,
+                help="Runs pose tracking locally first (~10-20 s) and gives the AI measured numbers.",
+            )
+            start_side = st.radio(
+                "Which player is Tony (if two players are in frame)?",
+                ["largest", "left", "right"],
+                format_func={"largest": "Closest to camera", "left": "Left side", "right": "Right side"}.get,
+                horizontal=True,
+                disabled=not use_pose,
+            )
+
             instruction = st.text_area(
                 "Coach's Instruction (optional focus)",
                 value="Focus on racket preparation timing, footwork pattern and balance during the follow-through.",
@@ -230,7 +284,6 @@ with tab_solo:
 
             if st.button("Start AI Analysis", type="primary"):
                 chosen = [b for b in BENCHMARKS if b["id"] in selected_ids]
-                prompt = build_prompt(instruction, chosen)
                 file_extension = os.path.splitext(uploaded_file.name)[1] or ".mp4"
                 mime_type = (
                     uploaded_file.type
@@ -243,6 +296,20 @@ with tab_solo:
                     temp_filename = tfile.name
 
                 try:
+                    metrics = None
+                    if use_pose:
+                        with st.spinner("🦴 Tracking skeleton and measuring movement..."):
+                            try:
+                                pose = pose_metrics.analyze_clip(temp_filename, start_side=start_side)
+                            except Exception as e:
+                                pose = None
+                                st.warning(f"Skeleton tracking unavailable, continuing without it ({e}).")
+                        if pose:
+                            metrics = pose["metrics"]
+                            render_metrics(pose)
+                        elif pose is None:
+                            st.warning("Could not track a player in this clip; continuing without metrics.")
+                    prompt = build_prompt(instruction, chosen, metrics)
                     result = analyze_video(temp_filename, prompt, api_key, mime_type)
                     if result:
                         report = parse_report(result)
@@ -254,6 +321,7 @@ with tab_solo:
                                     filename=uploaded_file.name,
                                     note=note.strip(),
                                     benchmarks=[b["id"] for b in chosen],
+                                    metrics=metrics,
                                 )
                                 st.caption("💾 Saved to History tab.")
                             except OSError as e:
@@ -327,6 +395,11 @@ with tab_hist:
                 for issue in rep.get("issues") or []:
                     if isinstance(issue, dict):
                         st.markdown(f"- **{issue.get('area', '')}:** {issue.get('fix', '')}")
+                m = r.get("metrics")
+                if isinstance(m, dict):
+                    shown = [f"{label}: {m[k]:g} {unit}" for k, label, unit in METRIC_LABELS if m.get(k) is not None]
+                    if shown:
+                        st.caption("🦴 " + " · ".join(shown))
                 if st.button("Delete this session", key=f"del_{r['id']}"):
                     try:
                         history.delete_record(r["id"])

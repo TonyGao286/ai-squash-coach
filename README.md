@@ -18,3 +18,10 @@ structured JSON (score, strengths, issues vs. benchmark, drills) rendered as a r
 Every successful analysis is saved to `history.json` (override with `SQUASH_HISTORY_FILE`) and shown in
 the **History & Progress** tab with a score trend. Hosted filesystems (e.g. Streamlit Cloud) can reset on
 restart, so use the tab's download/restore buttons to back up.
+
+## Skeleton metrics
+`pose_metrics.py` runs MediaPipe Pose locally (bundled model in `models/`) and measures knee bend,
+torso lean, stance width, racket-hand speed and distance covered (normalised by torso length). The numbers
+are 2D and camera-angle dependent, and are passed to Gemini as supporting evidence. When two players overlap
+the tracker can merge them - the app shows a checkable skeleton frame and a low-confidence warning. Best
+results: one player clearly visible, fixed camera.

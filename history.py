@@ -36,7 +36,7 @@ def _write(records, path):
         raise
 
 
-def add_record(report, filename="", note="", benchmarks=(), path=HISTORY_FILE):
+def add_record(report, filename="", note="", benchmarks=(), metrics=None, path=HISTORY_FILE):
     record = {
         "id": uuid.uuid4().hex[:12],
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -44,6 +44,7 @@ def add_record(report, filename="", note="", benchmarks=(), path=HISTORY_FILE):
         "note": note,
         "benchmarks": list(benchmarks),
         "report": report,
+        "metrics": metrics,
     }
     records = load_history(path)
     records.append(record)
