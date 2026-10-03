@@ -3,6 +3,11 @@ import google.generativeai as genai
 import tempfile
 import os
 import time
+import mimetypes
+
+MODEL_NAME = "gemini-2.5-flash"
+MAX_UPLOAD_MB = 100
+PROCESSING_TIMEOUT_S = 300
 
 # --- 1. Page Configuration ---
 st.set_page_config(page_title="AI Squash Coach", page_icon="🎾", layout="wide") # 改为 wide 布局，让左右分栏更美观
@@ -10,8 +15,8 @@ st.set_page_config(page_title="AI Squash Coach", page_icon="🎾", layout="wide"
 # --- 2. API Key Setup (Secure Mode) ---
 try:
     api_key = st.secrets["GOOGLE_API_KEY"]
-except FileNotFoundError:
-    api_key = None 
+except (FileNotFoundError, KeyError):
+    api_key = os.environ.get("GOOGLE_API_KEY")
 
 # --- 3. Sidebar: Clean & Professional ---
 with st.sidebar:
@@ -19,7 +24,10 @@ with st.sidebar:
     if not api_key:
         api_key = st.text_input("Enter Google API Key (Developer Mode)", type="password")
     
-    st.success("🟢 AI Engine Online")
+    if api_key:
+        st.success("🟢 API key configured")
+    else:
+        st.warning("🟠 API key required")
     st.info("💡 Powered by Gemini Vision AI. \n\nDeveloper: Tony Gao")
 
 # --- 4. Core Logic Function ---
@@ -27,23 +35,49 @@ def analyze_video(video_path, prompt, key, mime_type):
     genai.configure(api_key=key)
     status_text = st.empty()
     status_text.info("🚀 Uploading footage to AI engine...")
-    
+
     video_file = genai.upload_file(path=video_path, mime_type=mime_type)
-    
-    while video_file.state.name == "PROCESSING":
-        status_text.info("⏳ Processing video, AI is analyzing court movement...")
-        time.sleep(2)
-        video_file = genai.get_file(video_file.name)
+    try:
+        deadline = time.monotonic() + PROCESSING_TIMEOUT_S
+        while video_file.state.name == "PROCESSING":
+            if time.monotonic() > deadline:
+                status_text.empty()
+                st.error("❌ Video processing timed out. Try a shorter clip.")
+                return None
+            status_text.info("⏳ Processing video, AI is analyzing court movement...")
+            time.sleep(2)
+            video_file = genai.get_file(video_file.name)
 
-    if video_file.state.name == "FAILED":
-        st.error(f"❌ Video processing failed: {video_file.state.name}")
-        return None
+        if video_file.state.name != "ACTIVE":
+            status_text.empty()
+            st.error(f"❌ Video processing failed (state: {video_file.state.name}).")
+            return None
 
-    status_text.info("🧠 Generating tactical and technical feedback...")
-    model = genai.GenerativeModel(model_name="gemini-2.5-flash")
-    response = model.generate_content([video_file, prompt])
-    status_text.success("✅ Analysis Complete!")
-    return response.text
+        status_text.info("🧠 Generating tactical and technical feedback...")
+        model = genai.GenerativeModel(model_name=MODEL_NAME)
+        response = model.generate_content([video_file, prompt])
+        try:
+            text = response.text
+        except ValueError:
+            # Blocked or empty response
+            status_text.empty()
+            st.error("❌ The AI returned no content (possibly blocked by safety filters).")
+            return None
+        status_text.success("✅ Analysis Complete!")
+        return text
+    finally:
+        # Don't leave user footage on Google's servers
+        try:
+            genai.delete_file(video_file.name)
+        except Exception:
+            pass
+
+
+def show_local_video(path):
+    if os.path.exists(path):
+        st.video(path)
+    else:
+        st.warning(f"Video file '{path}' not found in repository.")
 
 # --- 5. Main UI with Tabs ---
 st.title("🎾 Next-Gen Squash AI Coach")
@@ -55,14 +89,19 @@ tab_solo, tab_pro = st.tabs(["📹 Solo Training (Analyze My Video)", "🏆 Pro 
 # ==== 选项卡 1：原本的上传分析功能 ====
 with tab_solo:
     st.markdown("### Upload Your Footage")
-    uploaded_file = st.file_uploader("Upload video clip (Recommended length: < 30 seconds)", type=['mp4', 'mov', 'avi'])
+    uploaded_file = st.file_uploader(
+        f"Upload video clip (Recommended length: < 30 seconds, max {MAX_UPLOAD_MB} MB)",
+        type=['mp4', 'mov', 'avi'],
+    )
 
     if uploaded_file is not None:
-        if not api_key:
+        if uploaded_file.size > MAX_UPLOAD_MB * 1024 * 1024:
+            st.error(f"❌ File is too large (max {MAX_UPLOAD_MB} MB).")
+        elif not api_key:
              st.error("❌ API Key not detected. Please check system configurations.")
         else:
             # 限制个人视频的显示宽度
-            col_video, col_blank = st.columns([1, 1])
+            col_video, _ = st.columns([1, 1])
             with col_video:
                 st.video(uploaded_file)
             
@@ -84,16 +123,19 @@ with tab_solo:
             prompt = st.text_area("Coach's Instruction (Prompt)", value=default_prompt, height=180)
 
             if st.button("Start AI Analysis", type="primary"):
-                file_extension = os.path.splitext(uploaded_file.name)[1]
-                if not file_extension:
-                    file_extension = ".mp4"
+                file_extension = os.path.splitext(uploaded_file.name)[1] or ".mp4"
+                mime_type = (
+                    uploaded_file.type
+                    or mimetypes.guess_type(uploaded_file.name)[0]
+                    or "video/mp4"
+                )
 
                 with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tfile:
-                    tfile.write(uploaded_file.read())
+                    tfile.write(uploaded_file.getvalue())
                     temp_filename = tfile.name
-                
+
                 try:
-                    result = analyze_video(temp_filename, prompt, api_key, uploaded_file.type)
+                    result = analyze_video(temp_filename, prompt, api_key, mime_type)
                     if result:
                         st.markdown("### 📋 AI Scouting Report")
                         st.markdown(result)
@@ -102,7 +144,7 @@ with tab_solo:
                 finally:
                     try:
                         os.remove(temp_filename)
-                    except:
+                    except OSError:
                         pass
 
 # ==== 选项卡 2：职业球员战术解析展厅 ====
@@ -115,10 +157,7 @@ with tab_pro:
     col1, col2 = st.columns([1, 1.2]) # 左边视频，右边文字
     
     with col1:
-        try:
-            st.video("coll_match.mp4")
-        except:
-            st.warning("Video file 'coll_match.mp4' not found in repository.")
+        show_local_video("coll_match.mp4")
             
     with col2:
         st.markdown("**🎯 Prompt to Gemini Vision:**")
@@ -138,10 +177,7 @@ with tab_pro:
     col3, col4 = st.columns([1, 1.2])
     
     with col3:
-        try:
-            st.video("coll_volley.mp4")
-        except:
-            st.warning("Video file 'coll_volley.mp4' not found in repository.")
+        show_local_video("coll_volley.mp4")
             
     with col4:
         st.markdown("**🎯 Prompt to Gemini Vision:**")
