@@ -1,5 +1,6 @@
 import streamlit as st
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import tempfile
 import os
 import time
@@ -127,37 +128,43 @@ def render_report(report):
 
 
 # --- 5. Core logic ---
+def _state_name(f):
+    state = getattr(f, "state", None)
+    return getattr(state, "name", None) or str(state or "ACTIVE")
+
+
 def analyze_video(video_path, prompt, key, mime_type):
-    genai.configure(api_key=key)
+    client = genai.Client(api_key=key)
     status_text = st.empty()
     status_text.info("🚀 Uploading footage to AI engine...")
 
-    video_file = genai.upload_file(path=video_path, mime_type=mime_type)
+    video_file = client.files.upload(file=video_path, config=types.UploadFileConfig(mime_type=mime_type))
     try:
         deadline = time.monotonic() + PROCESSING_TIMEOUT_S
-        while video_file.state.name == "PROCESSING":
+        while _state_name(video_file) == "PROCESSING":
             if time.monotonic() > deadline:
                 status_text.empty()
                 st.error("❌ Video processing timed out. Try a shorter clip.")
                 return None
             status_text.info("⏳ Processing video, AI is analyzing court movement...")
             time.sleep(2)
-            video_file = genai.get_file(video_file.name)
+            video_file = client.files.get(name=video_file.name)
 
-        if video_file.state.name != "ACTIVE":
+        if _state_name(video_file) != "ACTIVE":
             status_text.empty()
-            st.error(f"❌ Video processing failed (state: {video_file.state.name}).")
+            st.error(f"❌ Video processing failed (state: {_state_name(video_file)}).")
             return None
 
         status_text.info("🧠 Generating tactical and technical feedback...")
-        model = genai.GenerativeModel(
-            model_name=MODEL_NAME,
-            generation_config={"response_mime_type": "application/json", "temperature": 0.3},
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=[video_file, prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json", temperature=0.3
+            ),
         )
-        response = model.generate_content([video_file, prompt])
-        try:
-            text = response.text
-        except ValueError:
+        text = response.text
+        if not text:
             # Blocked or empty response
             status_text.empty()
             st.error("❌ The AI returned no content (possibly blocked by safety filters).")
@@ -167,7 +174,7 @@ def analyze_video(video_path, prompt, key, mime_type):
     finally:
         # Don't leave user footage on Google's servers
         try:
-            genai.delete_file(video_file.name)
+            client.files.delete(name=video_file.name)
         except Exception:
             pass
 
