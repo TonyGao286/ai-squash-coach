@@ -4,6 +4,8 @@ import tempfile
 import os
 import time
 import mimetypes
+import json
+import re
 
 MODEL_NAME = "gemini-2.5-flash"
 MAX_UPLOAD_MB = 100
@@ -30,7 +32,99 @@ with st.sidebar:
         st.warning("🟠 API key required")
     st.info("💡 Powered by Gemini Vision AI. \n\nDeveloper: Tony Gao")
 
-# --- 4. Core Logic Function ---
+# --- 4. Benchmarks & prompt building ---
+BENCHMARK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmarks.json")
+
+
+@st.cache_data
+def load_benchmarks():
+    try:
+        with open(BENCHMARK_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+BENCHMARKS = load_benchmarks()
+
+OUTPUT_SCHEMA = """{
+  "visual_confirmation": "player clothing colors and the exact shot/drill seen in THIS video",
+  "overall_score": <integer 1-10>,
+  "summary": "2-3 sentence overall assessment",
+  "strengths": ["specific strength observed in this clip", ...],
+  "issues": [
+    {"area": "Racket preparation | Footwork | Balance & posture | Recovery | Other",
+     "observation": "what happens in this clip, with approximate timestamp",
+     "benchmark_gap": "how it differs from the benchmark (or 'n/a' if no benchmark)",
+     "fix": "one concrete correction"}
+  ],
+  "drills": [{"name": "drill name", "how": "how to do it", "goal": "what it fixes"}]
+}"""
+
+
+def build_prompt(coach_instruction, benchmarks):
+    parts = [
+        "Act as an elite squash biomechanics analyst. Base your analysis STRICTLY on the "
+        "visual evidence in this specific video. Do not use generic squash cliches. "
+        "If something cannot be judged from the footage, say so instead of guessing.",
+        coach_instruction.strip(),
+    ]
+    if benchmarks:
+        parts.append("Compare the player against these professional benchmarks:")
+        for b in benchmarks:
+            points = "\n".join(f"- {p}" for p in b["key_points"])
+            parts.append(f"Benchmark - {b['player']}: {b['title']}\n{b['focus']}\n{points}")
+    parts.append(
+        "Respond with ONLY valid JSON (no markdown fences) matching this shape:\n" + OUTPUT_SCHEMA
+    )
+    return "\n\n".join(parts)
+
+
+def parse_report(text):
+    """Parse model output as JSON; return None if it isn't a valid report."""
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
+    try:
+        data = json.loads(cleaned)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def render_report(report):
+    st.markdown("### 📋 AI Scouting Report")
+    score = report.get("overall_score")
+    if isinstance(score, (int, float)):
+        st.metric("Overall score", f"{score}/10")
+    if report.get("summary"):
+        st.markdown(report["summary"])
+    if report.get("visual_confirmation"):
+        st.caption(f"👁️ Seen in video: {report['visual_confirmation']}")
+
+    if report.get("strengths"):
+        st.markdown("#### ✅ Strengths")
+        for item in report["strengths"]:
+            st.markdown(f"- {item}")
+
+    if report.get("issues"):
+        st.markdown("#### 🔧 Things to fix")
+        for issue in report["issues"]:
+            if not isinstance(issue, dict):
+                continue
+            with st.expander(issue.get("area", "Issue"), expanded=True):
+                st.markdown(f"**Observation:** {issue.get('observation', '')}")
+                gap = issue.get("benchmark_gap")
+                if gap and gap.lower() != "n/a":
+                    st.markdown(f"**vs. benchmark:** {gap}")
+                st.markdown(f"**Fix:** {issue.get('fix', '')}")
+
+    if report.get("drills"):
+        st.markdown("#### 🏋️ Recommended drills")
+        for d in report["drills"]:
+            if isinstance(d, dict):
+                st.markdown(f"- **{d.get('name', '')}** - {d.get('how', '')} _(goal: {d.get('goal', '')})_")
+
+
+# --- 5. Core logic ---
 def analyze_video(video_path, prompt, key, mime_type):
     genai.configure(api_key=key)
     status_text = st.empty()
@@ -54,7 +148,10 @@ def analyze_video(video_path, prompt, key, mime_type):
             return None
 
         status_text.info("🧠 Generating tactical and technical feedback...")
-        model = genai.GenerativeModel(model_name=MODEL_NAME)
+        model = genai.GenerativeModel(
+            model_name=MODEL_NAME,
+            generation_config={"response_mime_type": "application/json", "temperature": 0.3},
+        )
         response = model.generate_content([video_file, prompt])
         try:
             text = response.text
@@ -79,14 +176,14 @@ def show_local_video(path):
     else:
         st.warning(f"Video file '{path}' not found in repository.")
 
-# --- 5. Main UI with Tabs ---
+
+# --- 6. Main UI with Tabs ---
 st.title("🎾 Next-Gen Squash AI Coach")
 st.markdown("Upload your practice footage, or explore AI tactical breakdowns of PSA professionals.")
 
-# 创建两个极其现代的选项卡
 tab_solo, tab_pro = st.tabs(["📹 Solo Training (Analyze My Video)", "🏆 Pro Case Studies (PSA)"])
 
-# ==== 选项卡 1：原本的上传分析功能 ====
+# ==== Tab 1: upload & analyze ====
 with tab_solo:
     st.markdown("### Upload Your Footage")
     uploaded_file = st.file_uploader(
@@ -98,31 +195,29 @@ with tab_solo:
         if uploaded_file.size > MAX_UPLOAD_MB * 1024 * 1024:
             st.error(f"❌ File is too large (max {MAX_UPLOAD_MB} MB).")
         elif not api_key:
-             st.error("❌ API Key not detected. Please check system configurations.")
+            st.error("❌ API Key not detected. Please check system configurations.")
         else:
-            # 限制个人视频的显示宽度
             col_video, _ = st.columns([1, 1])
             with col_video:
                 st.video(uploaded_file)
-            
-            default_prompt = """
-            Act as an elite squash biomechanics analyst. You MUST base your analysis STRICTLY on the visual evidence in this specific video. Do not use generic squash cliches.
 
-            Step 1: Visual Confirmation (Prove you watched the video)
-            Briefly describe the player's clothing colors and the specific type of shot/drill they are performing in this exact footage.
+            titles = {b["id"]: f"{b['player']} - {b['title']}" for b in BENCHMARKS}
+            selected_ids = st.multiselect(
+                "Compare against pro benchmarks",
+                options=list(titles),
+                default=list(titles),
+                format_func=titles.get,
+            )
 
-            Step 2: Biomechanical Critique
-            Based ONLY on the movement shown, provide 2-3 specific observations regarding:
-            - The exact timing of their racket preparation relative to the ball's bounce.
-            - Their specific footwork pattern (e.g., crossover step, lunge stability, or shuffle).
-            - Their balance and posture during the follow-through.
-
-            Highlight what is uniquely good or what specifically needs correction in THIS video clip.
-            """
-            
-            prompt = st.text_area("Coach's Instruction (Prompt)", value=default_prompt, height=180)
+            instruction = st.text_area(
+                "Coach's Instruction (optional focus)",
+                value="Focus on racket preparation timing, footwork pattern and balance during the follow-through.",
+                height=100,
+            )
 
             if st.button("Start AI Analysis", type="primary"):
+                chosen = [b for b in BENCHMARKS if b["id"] in selected_ids]
+                prompt = build_prompt(instruction, chosen)
                 file_extension = os.path.splitext(uploaded_file.name)[1] or ".mp4"
                 mime_type = (
                     uploaded_file.type
@@ -137,8 +232,12 @@ with tab_solo:
                 try:
                     result = analyze_video(temp_filename, prompt, api_key, mime_type)
                     if result:
-                        st.markdown("### 📋 AI Scouting Report")
-                        st.markdown(result)
+                        report = parse_report(result)
+                        if report:
+                            render_report(report)
+                        else:
+                            st.markdown("### 📋 AI Scouting Report")
+                            st.markdown(result)
                 except Exception as e:
                     st.error(f"An error occurred: {e}")
                 finally:
@@ -147,48 +246,23 @@ with tab_solo:
                     except OSError:
                         pass
 
-# ==== 选项卡 2：职业球员战术解析展厅 ====
+# ==== Tab 2: pro benchmark library ====
 with tab_pro:
-    st.markdown("### 🧠 AI Tactical Breakdown: Paul Coll (Former World #1)")
-    st.info("How does AI decode the movement and technique of 'Superman' on the PSA tour?")
-    
-    # --- 案例一：比赛飞扑回中 ---
-    st.markdown("#### Case 1: The 'Superman' Recovery (British Open)")
-    col1, col2 = st.columns([1, 1.2]) # 左边视频，右边文字
-    
-    with col1:
-        show_local_video("coll_match.mp4")
-            
-    with col2:
-        st.markdown("**🎯 Prompt to Gemini Vision:**")
-        st.code("Analyze the player in black (Paul Coll). Focus on his recovery path to the T-zone after the extreme lunge/dive in the front court.", language="text")
-        st.markdown("**💡 AI Output & Tactical Takeaway:**")
-        st.success("""
-        * **Incredible Resilience:** After the desperate retrieve, Coll instantly pushes off the floor using his core and front lunging leg.
-        * **Visual Discipline:** His eyes remain fixed on the front wall and his opponent, never dropping his head.
-        * **Efficiency:** Notice the explosive crossover step. He is back dominating the T-zone before the opponent can strike.
-        * **Takeaway for Tony:** Never admire your own shot. The point continues until the ball bounces twice. Immediate T-recovery is non-negotiable.
-        """)
-        
-    st.divider() # 分割线
-    
-    # --- 案例二：前场极速截击 ---
-    st.markdown("#### Case 2: Front-Court Volley Drill (Extreme Reaction)")
-    col3, col4 = st.columns([1, 1.2])
-    
-    with col3:
-        show_local_video("coll_volley.mp4")
-            
-    with col4:
-        st.markdown("**🎯 Prompt to Gemini Vision:**")
-        st.code("Analyze the rapid front-wall volley drill. Focus on racket preparation, backswing length, and wrist stability.", language="text")
-        st.markdown("**💡 AI Output & Technical Takeaway:**")
-        st.success("""
-        * **Shortened Backswing:** To cope with the rapid pace, the backswing is virtually eliminated. The racket head stays up and in front of the body at all times.
-        * **Locked Wrist:** The wrist remains completely stable. Power is generated purely from rapid forearm rotation and slight body weight transfer.
-        * **Target Fixation:** Outstanding hand-eye coordination with zero wasted movement.
-        * **Takeaway for Tony:** On aggressive front-court volleys, shorten the swing, lock the wrist, and keep the racket preparation extremely early.
-
-        """)
-
-
+    st.markdown("### 🧠 Tactical Breakdown: Paul Coll (Former World #1)")
+    st.info(
+        "These curated breakdowns are the reference benchmarks used when analyzing your own video."
+    )
+    if not BENCHMARKS:
+        st.warning("No benchmarks found (benchmarks.json is missing or invalid).")
+    for i, b in enumerate(BENCHMARKS, start=1):
+        st.markdown(f"#### Case {i}: {b['title']}")
+        col_v, col_t = st.columns([1, 1.2])
+        with col_v:
+            show_local_video(b["video"])
+        with col_t:
+            st.markdown("**🎯 Focus:**")
+            st.code(b["prompt"], language="text")
+            st.markdown("**💡 Key points:**")
+            st.success("\n".join(f"* {p}" for p in b["key_points"]))
+        if i < len(BENCHMARKS):
+            st.divider()

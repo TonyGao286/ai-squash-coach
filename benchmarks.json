@@ -1,0 +1,30 @@
+[
+  {
+    "id": "coll_recovery",
+    "title": "The 'Superman' Recovery (British Open)",
+    "player": "Paul Coll",
+    "video": "coll_match.mp4",
+    "focus": "Recovery path to the T-zone after an extreme front-court lunge/dive.",
+    "prompt": "Analyze the player in black (Paul Coll). Focus on his recovery path to the T-zone after the extreme lunge/dive in the front court.",
+    "key_points": [
+      "Resilience: after the desperate retrieve, pushes off the floor immediately using the core and the front lunging leg.",
+      "Visual discipline: eyes stay fixed on the front wall and the opponent; the head never drops.",
+      "Efficiency: explosive crossover step; back dominating the T-zone before the opponent can strike.",
+      "Principle: never admire your own shot - the point continues until the ball bounces twice; immediate T-recovery is non-negotiable."
+    ]
+  },
+  {
+    "id": "coll_volley",
+    "title": "Front-Court Volley Drill (Extreme Reaction)",
+    "player": "Paul Coll",
+    "video": "coll_volley.mp4",
+    "focus": "Racket preparation, backswing length and wrist stability in rapid volleys.",
+    "prompt": "Analyze the rapid front-wall volley drill. Focus on racket preparation, backswing length, and wrist stability.",
+    "key_points": [
+      "Shortened backswing: virtually eliminated at this pace; the racket head stays up and in front of the body.",
+      "Locked wrist: power comes from forearm rotation and slight body weight transfer, not wrist flick.",
+      "Target fixation: excellent hand-eye coordination with zero wasted movement.",
+      "Principle: on aggressive front-court volleys, shorten the swing, lock the wrist, prepare the racket extremely early."
+    ]
+  }
+]
